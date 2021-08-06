@@ -35,14 +35,19 @@
  * close to the one of the R600 family (R600 likely being an evolution
  * of the RS600 GART block).
  */
-#include <drm/drmP.h>
+
+#include <linux/io-64-nonatomic-lo-hi.h>
+#include <linux/pci.h>
+
+#include <drm/drm_device.h>
+#include <drm/drm_vblank.h>
+
+#include "atom.h"
 #include "radeon.h"
 #include "radeon_asic.h"
 #include "radeon_audio.h"
-#include "atom.h"
-#include "rs600d.h"
-
 #include "rs600_reg_safe.h"
+#include "rs600d.h"
 
 static void rs600_gpu_init(struct radeon_device *rdev);
 int rs600_mc_wait_for_idle(struct radeon_device *rdev);
@@ -110,7 +115,7 @@ void avivo_wait_for_vblank(struct radeon_device *rdev, int crtc)
 	}
 }
 
-void rs600_page_flip(struct radeon_device *rdev, int crtc_id, u64 crtc_base)
+void rs600_page_flip(struct radeon_device *rdev, int crtc_id, u64 crtc_base, bool async)
 {
 	struct radeon_crtc *radeon_crtc = rdev->mode_info.crtcs[crtc_id];
 	u32 tmp = RREG32(AVIVO_D1GRPH_UPDATE + radeon_crtc->crtc_offset);
@@ -121,6 +126,8 @@ void rs600_page_flip(struct radeon_device *rdev, int crtc_id, u64 crtc_base)
 	WREG32(AVIVO_D1GRPH_UPDATE + radeon_crtc->crtc_offset, tmp);
 
 	/* update the scanout addresses */
+	WREG32(AVIVO_D1GRPH_FLIP_CONTROL + radeon_crtc->crtc_offset,
+	       async ? AVIVO_D1GRPH_SURFACE_UPDATE_H_RETRACE_EN : 0);
 	WREG32(AVIVO_D1GRPH_SECONDARY_SURFACE_ADDRESS + radeon_crtc->crtc_offset,
 	       (u32)crtc_base);
 	WREG32(AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS + radeon_crtc->crtc_offset,
@@ -413,7 +420,8 @@ void rs600_hpd_init(struct radeon_device *rdev)
 		default:
 			break;
 		}
-		enable |= 1 << radeon_connector->hpd.hpd;
+		if (radeon_connector->hpd.hpd != RADEON_HPD_NONE)
+			enable |= 1 << radeon_connector->hpd.hpd;
 		radeon_hpd_set_polarity(rdev, radeon_connector->hpd.hpd);
 	}
 	radeon_irq_kms_enable_hpd(rdev, enable);
@@ -439,12 +447,13 @@ void rs600_hpd_fini(struct radeon_device *rdev)
 		default:
 			break;
 		}
-		disable |= 1 << radeon_connector->hpd.hpd;
+		if (radeon_connector->hpd.hpd != RADEON_HPD_NONE)
+			disable |= 1 << radeon_connector->hpd.hpd;
 	}
 	radeon_irq_kms_disable_hpd(rdev, disable);
 }
 
-int rs600_asic_reset(struct radeon_device *rdev)
+int rs600_asic_reset(struct radeon_device *rdev, bool hard)
 {
 	struct rv515_mc_save save;
 	u32 status, tmp;
@@ -936,12 +945,6 @@ void rs600_mc_wreg(struct radeon_device *rdev, uint32_t reg, uint32_t v)
 	spin_unlock_irqrestore(&rdev->mc_idx_lock, flags);
 }
 
-static void rs600_debugfs(struct radeon_device *rdev)
-{
-	if (r100_debugfs_rbbm_init(rdev))
-		DRM_ERROR("Failed to register debugfs file for RBBM !\n");
-}
-
 void rs600_set_safe_registers(struct radeon_device *rdev)
 {
 	rdev->config.r300.reg_safe_bm = rs600_reg_safe_bm;
@@ -1127,7 +1130,7 @@ int rs600_init(struct radeon_device *rdev)
 	radeon_get_clock_info(rdev->ddev);
 	/* initialize memory controller */
 	rs600_mc_init(rdev);
-	rs600_debugfs(rdev);
+	r100_debugfs_rbbm_init(rdev);
 	/* Fence driver */
 	r = radeon_fence_driver_init(rdev);
 	if (r)

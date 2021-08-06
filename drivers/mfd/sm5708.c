@@ -18,284 +18,190 @@
 
 #include <linux/module.h>
 #include <linux/slab.h>
-#include <linux/i2c.h>
 #include <linux/irq.h>
 #include <linux/interrupt.h>
-#include <linux/mutex.h>
 #include <linux/mfd/core.h>
-#include <linux/mfd/sm5708/sm5708.h>
 #include <linux/regulator/machine.h>
-
-#include <linux/muic/muic.h>
-
-#if defined(CONFIG_OF)
+#include <linux/err.h>
+#include <linux/delay.h>
 #include <linux/of_device.h>
 #include <linux/of_gpio.h>
-#endif /* CONFIG_OF */
+#include <linux/of_irq.h>
 
-#define I2C_ADDR_PMIC	(0x92 >> 1)
+#include <linux/mfd/sm5708.h>
+
+#define MFD_DEV_NAME "sm5708-mfd"
+
+#define SM5708_IRQ(name, regnum) \
+	REGMAP_IRQ_REG(name##_IRQ, regnum - 1, name##_STATUS##regnum)
+
+static const struct regmap_irq sm5708_irqs[] = {
+	SM5708_IRQ(SM5708_VBUSPOK,     1),
+	SM5708_IRQ(SM5708_VBUSUVLO,    1),
+	SM5708_IRQ(SM5708_VBUSOVP,     1),
+	SM5708_IRQ(SM5708_VBUSLIMIT,   1),
+
+	SM5708_IRQ(SM5708_AICL,        2),
+	SM5708_IRQ(SM5708_BATOVP,      2),
+	SM5708_IRQ(SM5708_NOBAT,       2),
+	SM5708_IRQ(SM5708_CHGON,       2),
+	SM5708_IRQ(SM5708_Q4FULLON,    2),
+	SM5708_IRQ(SM5708_TOPOFF,      2),
+	SM5708_IRQ(SM5708_DONE,        2),
+	SM5708_IRQ(SM5708_WDTMROFF,    2),
+
+	SM5708_IRQ(SM5708_THEMREG,     3),
+	SM5708_IRQ(SM5708_THEMSHDN,    3),
+	SM5708_IRQ(SM5708_OTGFAIL,     3),
+	SM5708_IRQ(SM5708_DISLIMIT,    3),
+	SM5708_IRQ(SM5708_PRETMROFF,   3),
+	SM5708_IRQ(SM5708_FASTTMROFF,  3),
+	SM5708_IRQ(SM5708_LOWBATT,     3),
+	SM5708_IRQ(SM5708_nENQ4,       3),
+
+	SM5708_IRQ(SM5708_FLED1SHORT,  4),
+	SM5708_IRQ(SM5708_FLED1OPEN,   4),
+	SM5708_IRQ(SM5708_FLED2SHORT,  4),
+	SM5708_IRQ(SM5708_FLED2OPEN,   4),
+	SM5708_IRQ(SM5708_BOOSTPOK_NG, 4),
+	SM5708_IRQ(SM5708_BOOSTPOK,    4),
+	SM5708_IRQ(SM5708_ABSTMR1OFF,  4),
+	SM5708_IRQ(SM5708_SBPS,        4),
+};
+
+static bool sm5708_volatile_reg(struct device *dev, unsigned int reg)
+{
+	switch (reg) {
+	case SM5708_REG_INT1 ... SM5708_REG_INT4:
+	case SM5708_REG_STATUS1 ... SM5708_REG_STATUS4:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static const struct regmap_config sm5708_regmap_config = {
+	.reg_bits	= 8,
+	.val_bits	= 8,
+	.volatile_reg	= sm5708_volatile_reg,
+	.max_register	= SM5708_REG_MAX,
+};
+
+void sm5708_request_mode(struct device *dev, u8 mode_mask, bool enable) {
+	struct sm5708_chip *chip = (struct sm5708_chip*) dev_get_drvdata(dev);
+	u8 new_mode;
+	int boost_output = SM5708_BST_OUT_4v5;
+	int otg_current = SM5708_OTG_CURRENT_500mA;
+	int op_mode = SM5708_MODE_CHG_ON;
+
+	mutex_lock(&chip->mode_mutex);
+
+	if (enable)
+		new_mode = chip->requested_mode | mode_mask;
+	else
+		new_mode = chip->requested_mode & ~mode_mask;
+
+	if (new_mode == chip->requested_mode)
+		goto unlock;
+
+	switch(new_mode & ~SM5708_TORCH) {
+		case SM5708_FLASH:
+		case SM5708_FLASH | SM5708_CHARGE:
+			op_mode = SM5708_MODE_FLASH_BOOST;
+			break;
+		case SM5708_FLASH | SM5708_OTG:
+			op_mode = SM5708_MODE_FLASH_BOOST;
+			otg_current = SM5708_OTG_CURRENT_900mA;
+			break;
+		case SM5708_OTG:
+			otg_current = SM5708_OTG_CURRENT_900mA;
+			boost_output = SM5708_BST_OUT_5v1;
+			op_mode = SM5708_MODE_USB_OTG;
+			break;
+		default:
+			if (new_mode == SM5708_TORCH)
+				op_mode = SM5708_MODE_FLASH_BOOST;
+	}
+
+	if (chip->op_mode == SM5708_MODE_USB_OTG &&
+		op_mode == SM5708_MODE_CHG_ON) {
+		regmap_update_bits(chip->regmap, SM5708_REG_CNTL, 0x7,
+				SM5708_MODE_SUSPEND);
+		msleep(80);
+	}
+
+	regmap_update_bits(chip->regmap, SM5708_REG_FLEDCNTL6, 0xf, boost_output);
+	regmap_update_bits(chip->regmap, SM5708_REG_CHGCNTL5, 0x3 << 2, otg_current << 2);
+	regmap_update_bits(chip->regmap, SM5708_REG_CNTL, 0x7, op_mode);
+
+	chip->op_mode = op_mode;
+	chip->requested_mode = new_mode;
+unlock:
+	mutex_unlock(&chip->mode_mutex);
+}
+EXPORT_SYMBOL(sm5708_request_mode);
+
+static const struct regmap_irq_chip sm5708_irq_chip = {
+	.name		= MFD_DEV_NAME,
+	.status_base	= SM5708_REG_INT1,
+	.mask_base	= SM5708_REG_INTMSK1,
+	.num_regs	= 4,
+	.irqs		= sm5708_irqs,
+	.num_irqs	= ARRAY_SIZE(sm5708_irqs),
+};
 
 static struct mfd_cell sm5708_devs[] = {
-#if defined(CONFIG_REGULATOR_SM5708)
-	{ .name = "sm5708-usbldo", },
-#endif /* CONFIG_REGULATOR_SM5708 */
-#if defined(CONFIG_CHARGER_SM5708)
-	{ .name = "sm5708-charger", },
-#endif
-#if defined(CONFIG_LEDS_SM5708_RGB)
-	{ .name = "leds-sm5708-rgb", },
-#endif /* CONFIG_LEDS_SM5708_RGB */
-#if defined(CONFIG_LEDS_SM5708)
-	{ .name = "sm5708-fled", },
-#endif /* CONFIG_LEDS_SM5708 */
+	{ .name = "sm5708-charger", .of_compatible = "siliconmitus,sm5708-charger" },
+	{ .name = "sm5708-rgb-leds", .of_compatible = "siliconmitus,sm5708-leds" },
+	{ .name = "sm5708-fled", .of_compatible = "siliconmitus,sm5708-fled" },
 };
 
-int sm5708_read_reg(struct i2c_client *i2c, u8 reg, u8 *dest)
+static int sm5708_i2c_probe(struct i2c_client *i2c,
+		const struct i2c_device_id *dev_id)
 {
-	struct sm5708_dev *sm5708 = i2c_get_clientdata(i2c);
-	int ret;
-
-	mutex_lock(&sm5708->i2c_lock);
-	ret = i2c_smbus_read_byte_data(i2c, reg);
-	mutex_unlock(&sm5708->i2c_lock);
-	if (ret < 0) {
-		pr_info("%s:%s reg(0x%x), ret(%d)\n", MFD_DEV_NAME, __func__, reg, ret);
-		return ret;
-	}
-
-	ret &= 0xff;
-	*dest = ret;
-	return 0;
-}
-EXPORT_SYMBOL_GPL(sm5708_read_reg);
-
-int sm5708_bulk_read(struct i2c_client *i2c, u8 reg, int count, u8 *buf)
-{
-	struct sm5708_dev *sm5708 = i2c_get_clientdata(i2c);
-	int ret;
-
-	mutex_lock(&sm5708->i2c_lock);
-	ret = i2c_smbus_read_i2c_block_data(i2c, reg, count, buf);
-	mutex_unlock(&sm5708->i2c_lock);
-	if (ret < 0)
-		return ret;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(sm5708_bulk_read);
-
-int sm5708_read_word(struct i2c_client *i2c, u8 reg)
-{
-	struct sm5708_dev *sm5708 = i2c_get_clientdata(i2c);
-	int ret;
-
-	mutex_lock(&sm5708->i2c_lock);
-	ret = i2c_smbus_read_word_data(i2c, reg);
-	mutex_unlock(&sm5708->i2c_lock);
-	if (ret < 0)
-		return ret;
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(sm5708_read_word);
-
-int sm5708_write_reg(struct i2c_client *i2c, u8 reg, u8 value)
-{
-	struct sm5708_dev *sm5708 = i2c_get_clientdata(i2c);
-	int ret;
-
-	mutex_lock(&sm5708->i2c_lock);
-	ret = i2c_smbus_write_byte_data(i2c, reg, value);
-	mutex_unlock(&sm5708->i2c_lock);
-	if (ret < 0)
-		pr_info("%s:%s reg(0x%x), ret(%d)\n",
-				MFD_DEV_NAME, __func__, reg, ret);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(sm5708_write_reg);
-
-int sm5708_bulk_write(struct i2c_client *i2c, u8 reg, int count, u8 *buf)
-{
-	struct sm5708_dev *sm5708 = i2c_get_clientdata(i2c);
-	int ret;
-
-	mutex_lock(&sm5708->i2c_lock);
-	ret = i2c_smbus_write_i2c_block_data(i2c, reg, count, buf);
-	mutex_unlock(&sm5708->i2c_lock);
-	if (ret < 0)
-		return ret;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(sm5708_bulk_write);
-
-int sm5708_write_word(struct i2c_client *i2c, u8 reg, u16 value)
-{
-	struct sm5708_dev *sm5708 = i2c_get_clientdata(i2c);
-	int ret;
-
-	mutex_lock(&sm5708->i2c_lock);
-	ret = i2c_smbus_write_word_data(i2c, reg, value);
-	mutex_unlock(&sm5708->i2c_lock);
-	if (ret < 0)
-		return ret;
-	return 0;
-}
-EXPORT_SYMBOL_GPL(sm5708_write_word);
-
-int sm5708_update_reg(struct i2c_client *i2c, u8 reg, u8 val, u8 mask)
-{
-	struct sm5708_dev *sm5708 = i2c_get_clientdata(i2c);
-	int ret;
-
-	mutex_lock(&sm5708->i2c_lock);
-	ret = i2c_smbus_read_byte_data(i2c, reg);
-	if (ret >= 0) {
-		u8 old_val = ret & 0xff;
-		u8 new_val = (val & mask) | (old_val & (~mask));
-
-		ret = i2c_smbus_write_byte_data(i2c, reg, new_val);
-	}
-	mutex_unlock(&sm5708->i2c_lock);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(sm5708_update_reg);
-
-#if defined(CONFIG_OF)
-static int of_sm5708_dt(struct device *dev, struct sm5708_platform_data *pdata)
-{
-	struct device_node *np_sm5708 = dev->of_node;
-
-	if (!np_sm5708)
-		return -EINVAL;
-
-	pdata->irq_gpio = of_get_named_gpio(np_sm5708, "sm5708,irq-gpio", 0);
-	pdata->wakeup = of_property_read_bool(np_sm5708, "sm5708,wakeup");
-
-	pr_info("%s: irq-gpio: %u\n", __func__, pdata->irq_gpio);
-
-	return 0;
-}
-#else
-static int of_sm5708_dt(struct device *dev, struct sm5708_platform_data *pdata)
-{
-	return 0;
-}
-#endif /* CONFIG_OF */
-
-static int sm5708_i2c_probe(struct i2c_client *i2c,	const struct i2c_device_id *dev_id)
-{
-	struct sm5708_dev *sm5708;
-	struct sm5708_platform_data *pdata = i2c->dev.platform_data;
+	struct sm5708_chip *chip;
 	int ret = 0;
 
-	pr_info("%s:%s\n", MFD_DEV_NAME, __func__);
-
-	sm5708 = kzalloc(sizeof(struct sm5708_dev), GFP_KERNEL);
-	if (!sm5708)
+	chip = devm_kzalloc(&i2c->dev, sizeof(struct sm5708_chip), GFP_KERNEL);
+	if (!chip)
 		return -ENOMEM;
 
-	if (i2c->dev.of_node) {
-		pdata = devm_kzalloc(&i2c->dev, sizeof(struct sm5708_platform_data),
-				GFP_KERNEL);
-		if (!pdata) {
-			ret = -ENOMEM;
-			goto err;
-		}
+	i2c_set_clientdata(i2c, chip);
+	chip->dev = &i2c->dev;
+	chip->i2c = i2c;
+	chip->irq = i2c->irq;
+	mutex_init(&chip->mode_mutex);
 
-		ret = of_sm5708_dt(&i2c->dev, pdata);
-		if (ret < 0) {
-			dev_err(&i2c->dev, "Failed to get device of_node\n");
-			goto err;
-		}
+	chip->regmap = devm_regmap_init_i2c(i2c,
+			&sm5708_regmap_config);
 
-		i2c->dev.platform_data = pdata;
-	} else
-		pdata = i2c->dev.platform_data;
-
-	sm5708->dev = &i2c->dev;
-	sm5708->i2c = i2c;
-	sm5708->irq = i2c->irq;
-	if (pdata) {
-		sm5708->pdata = pdata;
-
-		pdata->irq_base = irq_alloc_descs(-1, 0, SM5708_MAX_IRQ, -1);
-		if (pdata->irq_base < 0) {
-			pr_err("%s:%s irq_alloc_descs Fail! ret(%d)\n",	MFD_DEV_NAME, __func__, pdata->irq_base);
-			ret = -EINVAL;
-			goto err;
-		} else
-			sm5708->irq_base = pdata->irq_base;
-
-		sm5708->irq_gpio = pdata->irq_gpio;
-		sm5708->wakeup = pdata->wakeup;
-	} else {
-		ret = -EINVAL;
-		goto err;
+	ret = regmap_add_irq_chip(chip->regmap, chip->irq,
+			IRQF_TRIGGER_LOW | IRQF_ONESHOT | IRQF_NO_SUSPEND,
+			0, &sm5708_irq_chip, &chip->irq_data);
+	if (ret) {
+		dev_err(&i2c->dev, "Failed to add IRQ chip: %d\n", ret);
+		return ret;
 	}
-	mutex_init(&sm5708->i2c_lock);
 
-	i2c_set_clientdata(i2c, sm5708);
-
-	ret = sm5708_irq_init(sm5708);
-
+	ret = devm_mfd_add_devices(chip->dev, -1, sm5708_devs,
+			ARRAY_SIZE(sm5708_devs), NULL, 0, NULL);
 	if (ret < 0)
-		goto err_irq_init;
+		return ret;
 
-	ret = mfd_add_devices(sm5708->dev, -1, sm5708_devs,	ARRAY_SIZE(sm5708_devs), NULL, 0, NULL);
-	if (ret < 0)
-		goto err_mfd;
-
-	device_init_wakeup(sm5708->dev, pdata->wakeup);
-
-	pr_info("%s:%s DONE\n", MFD_DEV_NAME, __func__);
-
-	return ret;
-
-err_mfd:
-	mfd_remove_devices(sm5708->dev);
-err_irq_init:
-	mutex_destroy(&sm5708->i2c_lock);
-err:
-	kfree(sm5708);
-	return ret;
-}
-
-static int sm5708_i2c_remove(struct i2c_client *i2c)
-{
-	struct sm5708_dev *sm5708 = i2c_get_clientdata(i2c);
-
-	mfd_remove_devices(sm5708->dev);
-	kfree(sm5708);
+	device_init_wakeup(chip->dev, 0);
 
 	return 0;
 }
 
-static const struct i2c_device_id sm5708_i2c_id[] = {
-	{ MFD_DEV_NAME, TYPE_SM5708 },
-	{ }
-};
-MODULE_DEVICE_TABLE(i2c, sm5708_i2c_id);
-
-#if defined(CONFIG_OF)
-static const struct of_device_id sm5708_i2c_dt_ids[] = {
-	{ .compatible = "sm,sm5708" },
-	{ },
-};
-MODULE_DEVICE_TABLE(of, sm5708_i2c_dt_ids);
-#endif /* CONFIG_OF */
-
-#if defined(CONFIG_PM)
 static int sm5708_suspend(struct device *dev)
 {
 	struct i2c_client *i2c = container_of(dev, struct i2c_client, dev);
-	struct sm5708_dev *sm5708 = i2c_get_clientdata(i2c);
+	struct sm5708_chip *chip = i2c_get_clientdata(i2c);
 
 	if (device_may_wakeup(dev))
-		enable_irq_wake(sm5708->irq);
+		enable_irq_wake(chip->irq);
 
-	disable_irq(sm5708->irq);
+	disable_irq(chip->irq);
 
 	return 0;
 }
@@ -303,114 +209,45 @@ static int sm5708_suspend(struct device *dev)
 static int sm5708_resume(struct device *dev)
 {
 	struct i2c_client *i2c = container_of(dev, struct i2c_client, dev);
-	struct sm5708_dev *sm5708 = i2c_get_clientdata(i2c);
-
-#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
-	pr_info("%s:%s\n", MFD_DEV_NAME, __func__);
-#endif /* CONFIG_SAMSUNG_PRODUCT_SHIP */
+	struct sm5708_chip *chip = i2c_get_clientdata(i2c);
 
 	if (device_may_wakeup(dev))
-		disable_irq_wake(sm5708->irq);
+		disable_irq_wake(chip->irq);
 
-	enable_irq(sm5708->irq);
+	enable_irq(chip->irq);
 
 	return 0;
 }
-#else
-#define sm5708_suspend	NULL
-#define sm5708_resume		NULL
-#endif /* CONFIG_PM */
 
-#ifdef CONFIG_HIBERNATION
-
-u8 sm5708_dumpaddr_led[] = {
-	SM5708_RGBLED_REG_LEDEN,
-	SM5708_RGBLED_REG_LED0BRT,
-	SM5708_RGBLED_REG_LED1BRT,
-	SM5708_RGBLED_REG_LED2BRT,
-	SM5708_RGBLED_REG_LED3BRT,
-	SM5708_RGBLED_REG_LEDBLNK,
-	SM5708_RGBLED_REG_LEDRMP,
-};
-
-static int sm5708_freeze(struct device *dev)
+static void sm5708_shutdown(struct device *dev)
 {
 	struct i2c_client *i2c = container_of(dev, struct i2c_client, dev);
-	struct sm5708_dev *sm5708 = i2c_get_clientdata(i2c);
-	int i;
+	struct sm5708_chip *chip = i2c_get_clientdata(i2c);
 
-	for (i = 0; i < ARRAY_SIZE(sm5708_dumpaddr_pmic); i++)
-		sm5708_read_reg(i2c, sm5708_dumpaddr_pmic[i],
-				&sm5708->reg_pmic_dump[i]);
-
-	for (i = 0; i < ARRAY_SIZE(sm5708_dumpaddr_led); i++)
-		sm5708_read_reg(i2c, sm5708_dumpaddr_led[i],
-				&sm5708->reg_led_dump[i]);
-
-	disable_irq(sm5708->irq);
-
-	return 0;
+	regmap_update_bits(chip->regmap, SM5708_REG_CNTL, 0x7,
+			SM5708_MODE_CHG_ON);
 }
 
-static int sm5708_restore(struct device *dev)
-{
-	struct i2c_client *i2c = container_of(dev, struct i2c_client, dev);
-	struct sm5708_dev *sm5708 = i2c_get_clientdata(i2c);
-	int i;
+static SIMPLE_DEV_PM_OPS(sm5708_pm, sm5708_suspend, sm5708_resume);
 
-	enable_irq(sm5708->irq);
-
-	for (i = 0; i < ARRAY_SIZE(sm5708_dumpaddr_pmic); i++)
-		sm5708_write_reg(i2c, sm5708_dumpaddr_pmic[i],
-				sm5708->reg_pmic_dump[i]);
-
-	for (i = 0; i < ARRAY_SIZE(sm5708_dumpaddr_led); i++)
-		sm5708_write_reg(i2c, sm5708_dumpaddr_led[i],
-				sm5708->reg_led_dump[i]);
-
-	return 0;
-}
-#endif
-
-const struct dev_pm_ops sm5708_pm = {
-	.suspend = sm5708_suspend,
-	.resume = sm5708_resume,
-#ifdef CONFIG_HIBERNATION
-	.freeze =  sm5708_freeze,
-	.thaw = sm5708_restore,
-	.restore = sm5708_restore,
-#endif
+static const struct of_device_id sm5708_i2c_dt_ids[] = {
+	{ .compatible = "siliconmitus,sm5708" },
+	{ },
 };
+MODULE_DEVICE_TABLE(of, sm5708_i2c_dt_ids);
 
 static struct i2c_driver sm5708_i2c_driver = {
 	.driver		= {
 		.name	= MFD_DEV_NAME,
 		.owner	= THIS_MODULE,
-#if defined(CONFIG_PM)
 		.pm	= &sm5708_pm,
-#endif /* CONFIG_PM */
-#if defined(CONFIG_OF)
 		.of_match_table	= sm5708_i2c_dt_ids,
-#endif /* CONFIG_OF */
+		.shutdown = sm5708_shutdown,
 	},
 	.probe		= sm5708_i2c_probe,
-	.remove		= sm5708_i2c_remove,
-	.id_table	= sm5708_i2c_id,
 };
 
-static int __init sm5708_i2c_init(void)
-{
-	pr_info("%s:%s\n", MFD_DEV_NAME, __func__);
-	return i2c_add_driver(&sm5708_i2c_driver);
-}
-/* init early so consumer devices can complete system boot */
-subsys_initcall(sm5708_i2c_init);
-
-static void __exit sm5708_i2c_exit(void)
-{
-	i2c_del_driver(&sm5708_i2c_driver);
-}
-module_exit(sm5708_i2c_exit);
+module_i2c_driver(sm5708_i2c_driver);
 
 MODULE_DESCRIPTION("SM5708 multi-function core driver");
 MODULE_LICENSE("GPL");

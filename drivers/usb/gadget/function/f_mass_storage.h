@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef USB_F_MASS_STORAGE_H
 #define USB_F_MASS_STORAGE_H
 
@@ -60,17 +61,6 @@ struct fsg_module_parameters {
 struct fsg_common;
 
 /* FSF callback functions */
-struct fsg_operations {
-	/*
-	 * Callback function to call when thread exits.  If no
-	 * callback is set or it returns value lower then zero MSF
-	 * will force eject all LUNs it operates on (including those
-	 * marked as non-removable or with prevent_medium_removal flag
-	 * set).
-	 */
-	int (*thread_exits)(struct fsg_common *common);
-};
-
 struct fsg_lun_opts {
 	struct config_group group;
 	struct fsg_lun *lun;
@@ -100,6 +90,7 @@ struct fsg_lun_config {
 	char removable;
 	char cdrom;
 	char nofua;
+	char inquiry_string[INQUIRY_STRING_LEN];
 };
 
 struct fsg_config {
@@ -118,88 +109,11 @@ struct fsg_config {
 	unsigned int		fsg_num_buffers;
 };
 
-#ifdef CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE
-/* Data shared by all the FSG instances. */
-struct fsg_common {
-	struct usb_gadget	*gadget;
-	struct usb_composite_dev *cdev;
-	struct fsg_dev		*fsg, *new_fsg;
-	wait_queue_head_t	fsg_wait;
-
-	/* filesem protects: backing files in use */
-	struct rw_semaphore	filesem;
-
-	/* lock protects: state, all the req_busy's */
-	spinlock_t		lock;
-
-	struct usb_ep		*ep0;		/* Copy of gadget->ep0 */
-	struct usb_request	*ep0req;	/* Copy of cdev->req */
-	unsigned int		ep0_req_tag;
-
-	struct fsg_buffhd	*next_buffhd_to_fill;
-	struct fsg_buffhd	*next_buffhd_to_drain;
-	struct fsg_buffhd	*buffhds;
-	unsigned int		fsg_num_buffers;
-	int			cmnd_size;
-	u8			cmnd[MAX_COMMAND_SIZE];
-
-	unsigned int		nluns;
-	unsigned int		lun;
-	struct fsg_lun		**luns;
-	struct fsg_lun		*curlun;
-
-	unsigned int		bulk_out_maxpacket;
-	enum fsg_state		state;		/* For exception handling */
-	unsigned int		exception_req_tag;
-
-	enum data_direction	data_dir;
-	u32			data_size;
-	u32			data_size_from_cmnd;
-	u32			tag;
-	u32			residue;
-	u32			usb_amount_left;
-
-	unsigned int		can_stall:1;
-	unsigned int		free_storage_on_release:1;
-	unsigned int		phase_error:1;
-	unsigned int		short_packet_received:1;
-	unsigned int		bad_lun_okay:1;
-	unsigned int		running:1;
-	unsigned int		sysfs:1;
-
-	int			thread_wakeup_needed;
-	struct completion	thread_notifier;
-	struct task_struct	*thread_task;
-
-	/* Callback functions. */
-	const struct fsg_operations	*ops;
-	/* Gadget's private data. */
-	void			*private_data;
-#ifdef CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE
-	char vendor_string[8 + 1];
-	char product_string[16 + 1];
-	/* Additional image version info for SUA */
-	char version_string[100 + 1];
-#endif
-	char inquiry_string[INQUIRY_MAX_LEN];
-	/* LUN name for sysfs purpose */
-	char name[FSG_MAX_LUNS][LUN_NAME_LEN];
-	struct kref		ref;
-	struct timer_list	vfs_timer;
-};
-
-
-#endif
-
 static inline struct fsg_opts *
 fsg_opts_from_func_inst(const struct usb_function_instance *fi)
 {
 	return container_of(fi, struct fsg_opts, func_inst);
 }
-
-void fsg_common_get(struct fsg_common *common);
-
-void fsg_common_put(struct fsg_common *common);
 
 void fsg_common_set_sysfs(struct fsg_common *common, bool sysfs);
 
@@ -210,16 +124,9 @@ void fsg_common_free_buffers(struct fsg_common *common);
 int fsg_common_set_cdev(struct fsg_common *common,
 			struct usb_composite_dev *cdev, bool can_stall);
 
-void fsg_common_remove_lun(struct fsg_lun *lun, bool sysfs);
+void fsg_common_remove_lun(struct fsg_lun *lun);
 
 void fsg_common_remove_luns(struct fsg_common *common);
-
-void fsg_common_free_luns(struct fsg_common *common);
-
-int fsg_common_set_nluns(struct fsg_common *common, int nluns);
-
-void fsg_common_set_ops(struct fsg_common *common,
-			const struct fsg_operations *ops);
 
 int fsg_common_create_lun(struct fsg_common *common, struct fsg_lun_config *cfg,
 			  unsigned int id, const char *name,
@@ -230,11 +137,8 @@ int fsg_common_create_luns(struct fsg_common *common, struct fsg_config *cfg);
 void fsg_common_set_inquiry_string(struct fsg_common *common, const char *vn,
 				   const char *pn);
 
-int fsg_common_run_thread(struct fsg_common *common);
-
 void fsg_config_from_params(struct fsg_config *cfg,
 			    const struct fsg_module_parameters *params,
 			    unsigned int fsg_num_buffers);
-int fsg_sysfs_update(struct fsg_common *common, struct device *dev,
-				bool create);
+
 #endif /* USB_F_MASS_STORAGE_H */
